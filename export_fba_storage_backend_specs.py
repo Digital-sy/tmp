@@ -10,8 +10,9 @@
 3. 同一最终粒度出现多组后台规格时，选择覆盖平均库存量最高的一组；
    库存相同时，依次选择覆盖仓库数更多、ETL 时间更新的一组；
 4. 本地 SKU 优先使用 sid + fnsku 直接匹配，直接匹配不到时使用安全覆盖映射；
-5. item_volume 统一换算为 cm³，weight 统一换算为 lb；
-6. 只输出业务指定的 13 列。
+5. item_volume 和 volume_units 保留接口原始值，不做体积单位换算；
+6. weight 统一换算为 lb；
+7. 只输出业务指定的 14 列。
 """
 from __future__ import annotations
 
@@ -53,7 +54,8 @@ OUTPUT_FIELDS = [
     "SKU",
     "店铺",
     "国家",
-    "商品体积item_volume立方厘米（cm³）",
+    "商品体积item_volume",
+    "商品体积单位volume_units",
     "弃置尺寸类型",
     "计费重量（lb)",
     "后台规格长",
@@ -229,28 +231,6 @@ def cte_sql(source_table: str, stores: list[str]) -> tuple[str, list[Any]]:
     return sql, params
 
 
-def volume_cm3_sql(alias: str = "r") -> str:
-    return f"""
-    CASE
-      WHEN {alias}.item_volume IS NULL THEN NULL
-      WHEN LOWER(TRIM({alias}.volume_units)) IN
-           ('cubic feet','cubic foot','cu ft','ft3','ft^3')
-        THEN ROUND({alias}.item_volume * 28316.846592,6)
-      WHEN LOWER(TRIM({alias}.volume_units)) IN
-           ('cubic inches','cubic inch','cu in','in3','in^3')
-        THEN ROUND({alias}.item_volume * 16.387064,6)
-      WHEN LOWER(TRIM({alias}.volume_units)) IN
-           ('cubic centimeters','cubic centimetres','cubic centimeter',
-            'cubic centimetre','cm3','cm^3')
-        THEN ROUND({alias}.item_volume,6)
-      WHEN LOWER(TRIM({alias}.volume_units)) IN
-           ('cubic meters','cubic metres','cubic meter','cubic metre','m3','m^3')
-        THEN ROUND({alias}.item_volume * 1000000,6)
-      ELSE NULL
-    END
-    """
-
-
 def weight_lb_sql(alias: str = "r") -> str:
     return f"""
     CASE
@@ -327,13 +307,8 @@ def main() -> None:
                 SELECT
                     COUNT(*) AS final_rows,
                     SUM(spec_group_cnt>1) AS multi_spec_rows,
-                    SUM(LOWER(TRIM(volume_units)) NOT IN (
-                        'cubic feet','cubic foot','cu ft','ft3','ft^3',
-                        'cubic inches','cubic inch','cu in','in3','in^3',
-                        'cubic centimeters','cubic centimetres','cubic centimeter',
-                        'cubic centimetre','cm3','cm^3',
-                        'cubic meters','cubic metres','cubic meter','cubic metre','m3','m^3'
-                    )) AS unsupported_volume_unit_rows,
+                    SUM(item_volume IS NULL) AS blank_item_volume_rows,
+                    SUM(COALESCE(TRIM(volume_units),'')='') AS blank_volume_unit_rows,
                     SUM(LOWER(TRIM(weight_units)) NOT IN (
                         'pounds','pound','lbs','lb','ounces','ounce','oz',
                         'kilograms','kilogram','kgs','kg','grams','gram','g'
@@ -358,8 +333,8 @@ def main() -> None:
                         AS `SKU`,
                     r.store_name AS `店铺`,
                     r.country_code AS `国家`,
-                    {volume_cm3_sql('r')}
-                        AS `商品体积item_volume立方厘米（cm³）`,
+                    r.item_volume AS `商品体积item_volume`,
+                    r.volume_units AS `商品体积单位volume_units`,
                     r.product_size_tier AS `弃置尺寸类型`,
                     {weight_lb_sql('r')} AS `计费重量（lb)`,
                     r.longest_side AS `后台规格长`,
@@ -396,7 +371,11 @@ def main() -> None:
 
     seen: set[tuple[str, str, str]] = set()
     for row in rows:
-        key = (str(row.get("店铺") or ""), str(row.get("FNSKU") or ""), str(row.get("国家") or ""))
+        key = (
+            str(row.get("店铺") or ""),
+            str(row.get("FNSKU") or ""),
+            str(row.get("国家") or ""),
+        )
         if key in seen:
             raise RuntimeError(f"最终粒度重复：{key}")
         seen.add(key)
@@ -417,8 +396,12 @@ def main() -> None:
     print(f"final_store_fnsku_country_rows\t{final_rows}")
     print(f"multi_spec_keys\t{int(final_summary.get('multi_spec_rows') or 0)}")
     print(
-        "unsupported_volume_unit_rows\t"
-        f"{int(final_summary.get('unsupported_volume_unit_rows') or 0)}"
+        "blank_item_volume_rows\t"
+        f"{int(final_summary.get('blank_item_volume_rows') or 0)}"
+    )
+    print(
+        "blank_volume_unit_rows\t"
+        f"{int(final_summary.get('blank_volume_unit_rows') or 0)}"
     )
     print(
         "unsupported_weight_unit_rows\t"
